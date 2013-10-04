@@ -1,6 +1,6 @@
 #!/usr/bin/ruby
 
-require '../lib/util.rb'      
+require './util.rb'      
 
 custCount = ARGV[0].to_i
 events = ['SL','SS','SM','ML','MS','MM','LL','LS','LM']
