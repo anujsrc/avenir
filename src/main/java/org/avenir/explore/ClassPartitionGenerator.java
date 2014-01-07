@@ -22,8 +22,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
@@ -61,15 +63,15 @@ public class ClassPartitionGenerator extends Configured implements Tool {
 	@Override
 	public int run(String[] args) throws Exception {
         Job job = new Job(getConf());
-        String jobName = "Partition generator for attributes";
+        String jobName = "Candidate split generator for attributes";
         job.setJobName(jobName);
-        
-        job.setJarByClass(CramerCorrelation.class);
-
-        FileInputFormat.addInputPath(job, new Path(args[0]));
-        FileOutputFormat.setOutputPath(job, new Path(args[1]));
-
+        job.setJarByClass(ClassPartitionGenerator.class);
         Utility.setConfiguration(job.getConfiguration(), "avenir");
+
+        String[] paths = getPaths(args, job);
+        FileInputFormat.addInputPath(job, new Path(paths[0]));
+        FileOutputFormat.setOutputPath(job, new Path(paths[1]));
+        
         job.setMapperClass(ClassPartitionGenerator.PartitionGeneratorMapper.class);
         job.setReducerClass(ClassPartitionGenerator.PartitionGeneratorReducer.class);
         job.setCombinerClass(ClassPartitionGenerator.PartitionGeneratorCombiner.class);
@@ -87,6 +89,20 @@ public class ClassPartitionGenerator extends Configured implements Tool {
         int status =  job.waitForCompletion(true) ? 0 : 1;
         return status;
 	}
+	
+	/**
+	 * Uses user provided paths
+	 * @param args
+	 * @param job
+	 * @return
+	 */
+	protected String[] getPaths(String[] args, Job job) {
+		String[] paths = new String[2];
+		paths[0] = args[0];
+		paths[1] = args[1];
+		return paths;
+	}
+	
 	/**
 	 * @author pranab
 	 *
@@ -101,6 +117,7 @@ public class ClassPartitionGenerator extends Configured implements Tool {
         private AttributeSplitHandler splitHandler = new AttributeSplitHandler();
         private FeatureField classField;
         private boolean atRoot = false;
+        private int maxCatAttrSplitGroups;
         private static final Logger LOG = Logger.getLogger(PartitionGeneratorMapper.class);
 
         /* (non-Javadoc)
@@ -112,23 +129,72 @@ public class ClassPartitionGenerator extends Configured implements Tool {
             	LOG.setLevel(Level.DEBUG);
             }
         	fieldDelimRegex = conf.get("field.delim.regex", ",");
+        	
+        	maxCatAttrSplitGroups = conf.getInt("max.cat.attr.split.groups", 3);
+        	
+        	//schema
         	InputStream fs = Utility.getFileStream(context.getConfiguration(), "feature.schema.file.path");
             ObjectMapper mapper = new ObjectMapper();
             schema = mapper.readValue(fs, FeatureSchema.class);
             
+            //attribute selection strategy
+            String attrSelectStrategy = conf.get("split.attribute.selection.strategy");
+            
+            //get split attributes
+            getSplitAttributes(attrSelectStrategy, conf);
+            
             //generate all attribute splits
-            String attrs = conf.get("split.attributes");
-            if (null != attrs) {
-            	splitAttrs = Utility.intArrayFromString(attrs, ",");
-            	createPartitions();
-            	LOG.debug("processing attribute splits");
-            } else {
-            	atRoot = true;
-            	LOG.debug("processing at root");
+            if (!atRoot) {
+	            createPartitions();
+	            LOG.debug("created split partitions");
             }
+            
             //class attribute
             classField = schema.findClassAttrField();
         }
+        
+        /**
+         * @param attrSelectStrategy
+         * @param conf
+         */
+        private void getSplitAttributes(String attrSelectStrategy, Configuration conf) {
+            atRoot = conf.getBoolean("at.root", false);
+            if (atRoot) {
+            	LOG.debug("processing at root");
+            } else if (attrSelectStrategy.equals("userSpecified")) {
+            	//user specified attributes
+	            String attrs = conf.get("split.attributes");
+	            splitAttrs = Utility.intArrayFromString(attrs, ",");
+            } else if (attrSelectStrategy.equals("all")) {
+            	//all attributes
+            	splitAttrs = schema.getFeatureFieldOrdinals();
+            } else if (attrSelectStrategy.equals("notUsedYet")) {
+            	//attributes that have not been used yet
+            	int[] allSplitAttrs = schema.getFeatureFieldOrdinals();
+            	int[] usedSplitAppributes = null; //TODO
+            	splitAttrs = Utility.removeItems(allSplitAttrs, usedSplitAppributes);
+            	
+            } else if (attrSelectStrategy.equals("random")) {
+            	//randomly selected k attributes
+            	int randomSplitSetSize = conf.getInt("random.split.set.size", 3);
+               	int[] allSplitAttrs = schema.getFeatureFieldOrdinals();
+               	Set<Integer> splitSet = new  HashSet<Integer>();
+               	while (splitSet.size() != randomSplitSetSize) {
+               		int splitIndex = (int)(Math.random() * allSplitAttrs.length);
+               		splitSet.add(allSplitAttrs[splitIndex]);
+               	}
+               	
+               	splitAttrs = new int[randomSplitSetSize];
+               	int i = 0;
+               	for (int spAttr : splitSet) {
+               		splitAttrs[i++] =  spAttr;
+               	}
+            } else {
+            	throw new IllegalArgumentException("invalid splitting attribute selection strategy");
+            }
+        	
+        }
+        
         
         @Override
         protected void map(LongWritable key, Text value, Context context)
@@ -142,23 +208,23 @@ public class ClassPartitionGenerator extends Configured implements Tool {
 				outKey.add(-1, "null", -1,classVal);
 				context.write(outKey, outVal);
             } else {
+            	//all attributes
 	            for (int attrOrd : splitAttrs) {
 	            	Integer attrOrdObj = attrOrd;
 	        		FeatureField featFld = schema.findFieldByOrdinal(attrOrd);
-	        		if (featFld.isInteger()) {
-	        			String attrValue = items[attrOrd];
-	        			splitHandler.selectAttribute(attrOrd);
-	        			String splitKey = null;
-	        			
-	        			//all splits
-	        			while((splitKey = splitHandler.next()) != null) {
-	        				Integer segmentIndex = splitHandler.getSegmentIndex(attrValue);
-	        				outKey.initialize();
-	        				outKey.add(attrOrdObj, splitKey, segmentIndex,classVal);
-	        				context.write(outKey, outVal);
-	        				context.getCounter("Stats", "mapper output count").increment(1);
-	        			}
-	        		}            	
+	        		
+        			String attrValue = items[attrOrd];
+        			splitHandler.selectAttribute(attrOrd);
+        			String splitKey = null;
+        			
+        			//all splits
+        			while((splitKey = splitHandler.next()) != null) {
+        				Integer segmentIndex = splitHandler.getSegmentIndex(attrValue);
+        				outKey.initialize();
+        				outKey.add(attrOrdObj, splitKey, segmentIndex,classVal);
+        				context.write(outKey, outVal);
+        				context.getCounter("Stats", "mapper output count").increment(1);
+        			}
 	            }
             }
         }
@@ -170,22 +236,46 @@ public class ClassPartitionGenerator extends Configured implements Tool {
         	for (int attrOrd : splitAttrs) {
         		FeatureField featFld = schema.findFieldByOrdinal(attrOrd);
         		if (featFld.isInteger()) {
+        			//numerical
         			List<Integer[]> splitList = new ArrayList<Integer[]>();
         			Integer[] splits = null;
         			createNumPartitions(splits, featFld, splitList);
+        			
+        			//collect all splits
         			for (Integer[] thisSplit : splitList) {
         				splitHandler.addIntSplits(attrOrd, thisSplit);
         			}
         		} else if (featFld.isCategorical()) {
-        			//TODO
+        			//categorical
+        			int numGroups = featFld.getMaxSplit();
+        			if (numGroups > maxCatAttrSplitGroups) {
+        				throw new IllegalArgumentException(
+        					"more than " +  maxCatAttrSplitGroups + " split groups not allwed for categorical attr");
+        			}
+        			
+        			//try all group count from 2 to max
+        			List<List<List<String>>> finalSplitList = new ArrayList<List<List<String>>>();
+        			for (int gr = 2; gr <= numGroups; ++gr) {
+        				LOG.debug("num of split sets:" + gr);
+        				List<List<List<String>>> splitList = new ArrayList<List<List<String>>>();
+        				createCatPartitions(splitList,  featFld.getCardinality(), 0, gr);
+        				finalSplitList.addAll(splitList);
+        			}
+        			
+        			//collect all splits
+        			for (List<List<String>> splitSets : finalSplitList) {
+        				splitHandler.addCategoricalSplits(attrOrd, splitSets);
+        			}
+        			
         		}
         	}
         }
         
         /**
-         * @param splits
+         * Create all possible splits within the max number of splits allowed
+         * @param splits previous split
          * @param featFld
-         * @param newSplitList
+         * @param newSplitList all possible splits
          */
         private void createNumPartitions(Integer[] splits, FeatureField featFld, 
         		List<Integer[]> newSplitList) {
@@ -193,6 +283,7 @@ public class ClassPartitionGenerator extends Configured implements Tool {
     		int max = (int)(featFld.getMax() + 0.01);
     		int binWidth = featFld.getBucketWidth();
         	if (null == splits) {
+        		//first time
         		for (int split = min + binWidth ; split < max; split += binWidth) {
         			Integer[] newSplits = new Integer[1];
         			newSplits[0] = split;
@@ -200,6 +291,7 @@ public class ClassPartitionGenerator extends Configured implements Tool {
         			createNumPartitions(newSplits, featFld,newSplitList);
         		}
         	} else {
+        		//create split based off last split that will contain one additinal split point
         		int len = splits.length;
         		if (len < featFld.getMaxSplit() -1) {
 	        		for (int split = splits[len -1] + binWidth; split < max; split += binWidth) {
@@ -210,13 +302,147 @@ public class ClassPartitionGenerator extends Configured implements Tool {
 	        			}
 	        			newSplits[i] = split;
 	        			newSplitList.add(newSplits);
+	        			
+	        			//recurse to generate additional splits
 	        			createNumPartitions(newSplits, featFld,newSplitList);
 	        		}
         		}
         	}
         }
+        
+        /**
+         * @param splits
+         * @param featFld
+         * @param newSplitList
+         */
+        private void createCatPartitions(List<List<List<String>>>  splitList, List<String> cardinality,
+        		int cardinalityIndex, int numGroups) {
+        	LOG.debug("next round cardinalityIndex:" + cardinalityIndex);
+    		//first time
+        	if (0 == cardinalityIndex) {
+    			//initial full splits
+    			List<List<String>> fullSp = createInitialSplit(cardinality, numGroups);
+
+    			//partial split shorter in length by one 
+    			List<List<List<String>>> partialSpList = createPartialSplit(cardinality,numGroups-1, numGroups);
+    			
+    			//split list
+    			splitList.add(fullSp);
+    			splitList.addAll(partialSpList);
+    			
+    			//recurse
+    			cardinalityIndex += numGroups;
+    			createCatPartitions(splitList, cardinality,cardinalityIndex, numGroups);
+    		//more elements to consume	
+        	} else if (cardinalityIndex < cardinality.size()){
+        		List<List<List<String>>>  newSplitList = new ArrayList<List<List<String>>>(); 
+        		String newElement = cardinality.get(cardinalityIndex);
+        		for (List<List<String>> sp : splitList) {
+        			if (sp.size() == numGroups) {
+        				//if full split, append new element to each group within split to create new splits
+        				LOG.debug("creating new split from full split");
+        				for (int i = 0; i < numGroups; ++i) {
+            				List<List<String>> newSp = new ArrayList<List<String>>();
+        					for (int j = 0; j < sp.size(); ++j) {
+        						List<String> gr = cloneStringList(sp.get(j));
+        						if (j == i) {
+        							//add new element
+        							gr.add(newElement);
+        						}
+        						newSp.add(gr);
+        					}
+        					newSplitList.add(newSp);
+        				}
+        			} else {
+        				//if partial split, create new group with new element and add to split
+        				LOG.debug("creating new split from partial split");
+        				List<List<String>> newSp = new ArrayList<List<String>>();
+    					for (int i = 0; i < sp.size(); ++i) {
+    						List<String> gr = cloneStringList(sp.get(i));
+    						newSp.add(gr);
+    					}
+    					List<String> newGr = new ArrayList<String>();
+    					newGr.add(newElement);
+    					newSp.add(newGr);
+    					newSplitList.add(newSp);
+        			}
+        			LOG.debug("newSplitList:" + newSplitList);
+        		}
+        		
+        		//generate partial splits
+        		if (cardinalityIndex < cardinality.size() -1){        		
+        			List<List<List<String>>> partialSpList = createPartialSplit(cardinality,cardinalityIndex, numGroups);
+    				newSplitList.addAll(partialSpList);
+        		}
+        		
+        		//replace old splits with new
+				splitList.clear();
+				splitList.addAll(newSplitList);
+				
+    			//recurse
+				++cardinalityIndex;
+    			createCatPartitions(splitList, cardinality,cardinalityIndex, numGroups);
+        	}
+        }	
+    	
+        /**
+         * @param cardinality
+         * @param numGroups
+         * @return
+         */
+        private List<List<String>> createInitialSplit(List<String> cardinality, int numGroups) {
+        	List<List<String>> newSp = new ArrayList<List<String>>();
+    		for (int i = 0; i < numGroups; ++i) {
+    			List<String> gr = new ArrayList<String>();
+    			gr.add(cardinality.get(i));
+    			newSp.add(gr);
+    		}
+    		LOG.debug("initial split:" + newSp);
+        	return newSp;
+        }
+        
+        /**
+         * @param cardinality
+         * @param cardinalityIndex
+         * @param numGroups
+         * @return
+         */
+        private List<List<List<String>>> createPartialSplit(List<String> cardinality,
+        		int cardinalityIndex, int numGroups) {
+			List<List<List<String>>> partialSplitList = new ArrayList<List<List<String>>>();
+        	if (numGroups == 2) {
+            	List<List<String>> newSp = new ArrayList<List<String>>();
+        		List<String> gr = new ArrayList<String>();
+        		for (int i = 0;i <= cardinalityIndex; ++i) {
+        			gr.add(cardinality.get(i));
+        		}
+        		newSp.add(gr);
+        		partialSplitList.add(newSp);
+        	} else {
+        		//create split list with splits shorter in length by 1
+        		List<String> partialCardinality = new ArrayList<String>();
+        		for (int i = 0; i <= cardinalityIndex; ++i) {
+        			partialCardinality.add(cardinality.get(i));
+        		}
+    			createCatPartitions(partialSplitList,  partialCardinality, 0, numGroups-1);
+        	}
+        	
+    		LOG.debug("partial split:" + partialSplitList);
+        	return partialSplitList;
+        }
+        
+        /**
+         * @param curList
+         * @return
+         */
+        private List<String> cloneStringList(List<String> curList) {
+        	List<String> newList = new ArrayList<String>();
+        	newList.addAll(curList);
+        	return newList;
+        }
 	}
-	
+
+    
 	/**
 	 * @author pranab
 	 *
